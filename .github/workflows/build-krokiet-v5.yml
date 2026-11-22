@@ -1,0 +1,81 @@
+name: Build Krokiet v5 (macOS ARM64)
+
+"on":
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-krokiet-v5.yml'
+      - 'krokiet_folder_compare_patch_12.0.2_v5.zip'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+
+    steps:
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Confirm Apple Silicon runner
+        shell: bash
+        run: |
+          uname -m
+          test "$(uname -m)" = "arm64"
+
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin
+          rustc --version
+          cargo --version
+
+      - name: Get Krokiet 12.0.2 and apply v5 patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f krokiet_folder_compare_patch_12.0.2_v5.zip
+          unzip -q krokiet_folder_compare_patch_12.0.2_v5.zip
+          test -f krokiet_folder_compare_patch/apply_patch.py
+          git clone --depth 1 --branch 12.0.2 https://github.com/qarmin/czkawka.git czkawka
+          python3 krokiet_folder_compare_patch/apply_patch.py czkawka
+
+      - name: Test Folder Compare and Folder Relationships
+        working-directory: czkawka
+        run: cargo test -p krokiet folder_ --locked --target aarch64-apple-darwin
+
+      - name: Remove test build to free disk space
+        shell: bash
+        run: rm -rf czkawka/target/aarch64-apple-darwin/debug
+
+      - name: Compile release executable for Apple Silicon
+        working-directory: czkawka
+        run: cargo build -p krokiet --release --locked --target aarch64-apple-darwin
+
+      - name: Package executable and verification script
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/package
+          cp czkawka/target/aarch64-apple-darwin/release/krokiet dist/package/krokiet
+          cp krokiet_folder_compare_patch/verify_folders.py dist/package/verify_folders.py
+          cp krokiet_folder_compare_patch/README_DE.md dist/package/README_DE.md
+          chmod +x dist/package/krokiet
+          file dist/package/krokiet
+          (cd dist/package && zip -q ../krokiet-v5-macos-arm64.zip krokiet verify_folders.py README_DE.md)
+
+      - name: Upload executable as GitHub Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: krokiet-v5-macos-arm64
+          path: dist/krokiet-v5-macos-arm64.zip
+          if-no-files-found: error
+          retention-days: 14
