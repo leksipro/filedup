@@ -1,0 +1,131 @@
+name: Build Krokiet v22-4 – Stable Paged Workspace and ACL Move (macOS ARM64)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'krokiet_folder_compare_patch_12.0.2_v22-4.zip'
+      - '.github/workflows/build-krokiet-v22-4.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: krokiet-v22-4-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '13.0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify Apple Silicon and ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = 'arm64'
+          test -f krokiet_folder_compare_patch_12.0.2_v22-4.zip
+          unzip -tq krokiet_folder_compare_patch_12.0.2_v22-4.zip
+          unzip -q krokiet_folder_compare_patch_12.0.2_v22-4.zip -d patch
+          test -f patch/krokiet_folder_compare_patch/apply_patch.py
+
+      - name: Run Python regression and UI checks
+        run: python3 -m unittest discover -s patch/krokiet_folder_compare_patch/tests -v
+
+      - name: Test backup ACL correction on isolated macOS fixtures
+        run: bash patch/krokiet_folder_compare_patch/tests/test_macos_backup_acl.sh
+
+      - name: Clone original Krokiet 12.0.2
+        run: git clone --depth 1 --branch 12.0.2 https://github.com/qarmin/czkawka.git czkawka
+
+      - name: Apply v22-4 patch
+        run: python3 patch/krokiet_folder_compare_patch/apply_patch.py "$GITHUB_WORKSPACE/czkawka"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Verify Cargo.lock remains deterministic
+        working-directory: czkawka
+        run: cargo metadata --locked --no-deps --format-version 1 > /dev/null
+
+      - name: Cache locked Rust dependencies and release artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            czkawka -> target
+          shared-key: krokiet-12-0-2-macos-arm64-release-v1
+          cache-on-failure: false
+
+      - name: Compile and run all Krokiet tests (release profile)
+        working-directory: czkawka
+        run: cargo test -p krokiet --locked --release --target aarch64-apple-darwin
+
+      - name: Compile release
+        working-directory: czkawka
+        run: cargo build -p krokiet --release --locked --target aarch64-apple-darwin
+
+      - name: Create unsigned-for-distribution ad-hoc signed macOS app
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary='czkawka/target/aarch64-apple-darwin/release/krokiet'
+          test -x "$binary"
+          file "$binary"
+          lipo -archs "$binary" | grep -qw 'arm64'
+          mkdir -p dist
+          app='dist/Krokiet Folder Compare.app'
+          mkdir -p "$app/Contents/MacOS"
+          cp "$binary" "$app/Contents/MacOS/krokiet"
+          chmod 755 "$app/Contents/MacOS/krokiet"
+          helper="$app/Contents/MacOS/krokiet-trash-diagnostics"
+          xcrun swiftc -target arm64-apple-macos13.0 -O patch/krokiet_folder_compare_patch/macos_trash_diagnostics.swift -o "$helper"
+          codesign --force --sign - "$helper"
+          if "$helper" "$RUNNER_TEMP/nonexistent-krokiet-diagnostic-test" 2> "$RUNNER_TEMP/krokiet-helper-test.txt"; then
+            echo 'Expected diagnostic failure for missing path' >&2; exit 1
+          fi
+          grep -q 'domain=NSPOSIXErrorDomain code=2' "$RUNNER_TEMP/krokiet-helper-test.txt"
+          cat > "$app/Contents/Info.plist" <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key><string>krokiet</string>
+            <key>CFBundleIdentifier</key><string>local.krokiet.foldercompare.v22</string>
+            <key>CFBundleName</key><string>Krokiet Folder Compare</string>
+            <key>CFBundleDisplayName</key><string>Krokiet Folder Compare</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>12.0.2</string>
+            <key>CFBundleVersion</key><string>224</string>
+            <key>LSMinimumSystemVersion</key><string>13.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint "$app/Contents/Info.plist"
+          codesign --force --sign - "$app"
+          codesign --verify --verbose=2 "$app"
+          cp patch/krokiet_folder_compare_patch/verify_folders.py dist/
+          cp patch/krokiet_folder_compare_patch/README_DE.md dist/
+          (cd dist && ditto -c -k --keepParent 'Krokiet Folder Compare.app' 'Krokiet-v22-4-macOS-arm64.app.zip')
+          (cd dist && shasum -a 256 'Krokiet-v22-4-macOS-arm64.app.zip' > SHA256SUMS.txt)
+
+      - name: Upload app and verifier
+        uses: actions/upload-artifact@v4
+        with:
+          name: krokiet-v22-4-macos-arm64-app
+          path: |
+            dist/Krokiet-v22-4-macOS-arm64.app.zip
+            dist/verify_folders.py
+            dist/README_DE.md
+            dist/SHA256SUMS.txt
+          retention-days: 30
+          if-no-files-found: error
